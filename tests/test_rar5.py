@@ -10,7 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from winrar import attacks, crypto, rar5          # noqa: E402
+from winrar import attacks, crypto, forensics, formats, rar5, zipcrypto  # noqa: E402
 
 SAMPLE = os.path.join(ROOT, "examples", "sample.rar")
 KNOWN_HASH = ("$rar5$16$2bd89e9e8f747efe77ccb1a889301979$15$"
@@ -128,6 +128,110 @@ class TestEngine(unittest.TestCase):
         cracker = engine.CpuEngine(entry, threads=2)
         result = cracker.crack(["nope"], total=1, quiet=True)
         self.assertIsNone(result.password)
+
+
+ZIP = os.path.join(ROOT, "examples", "sample_zipcrypto.zip")
+ZIP_AES = os.path.join(ROOT, "examples", "sample_aes.zip")
+SEVENZIP = os.path.join(ROOT, "examples", "sample_plain.7z")
+
+
+class TestZipCrypto(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.archive = formats.open_archive(ZIP)
+
+    def test_entries(self):
+        self.assertEqual(len(self.archive), 2)
+        self.assertTrue(all(e.kind == "zipcrypto" for e in self.archive.encrypted_entries))
+
+    def test_password_check(self):
+        entry = self.archive.zipcrypto_target()
+        self.assertTrue(zipcrypto.verify_entry(ZIP, entry, "123"))
+        self.assertFalse(zipcrypto.verify_entry(ZIP, entry, "124"))
+
+    def test_no_hashcat_format(self):
+        self.assertEqual(self.archive.hashes(), [])
+        self.assertIsNone(formats.mode_for(self.archive))
+
+    def test_engine_finds_password(self):
+        entry = self.archive.zipcrypto_target()
+        cracker = zipcrypto.ZipCryptoEngine(entry.header12, entry.check_byte, threads=2,
+                                            entry=entry, path=ZIP)
+        result = cracker.crack(["nope", "123"], total=2, quiet=True)
+        self.assertEqual(result.password, "123")
+
+
+class TestZipAes(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.archive = formats.open_archive(ZIP_AES)
+
+    def test_aes_detected(self):
+        self.assertEqual(self.archive.declared_crypto(), "WinZip AES-256")
+        self.assertEqual(self.archive.aes_target().aes_mode, 3)
+
+    def test_hash_format(self):
+        lines = self.archive.hashes()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("$zip2$*0*3*0*"))
+        self.assertTrue(lines[0].endswith("*$/zip2$"))
+
+    def test_mode(self):
+        self.assertEqual(formats.mode_for(self.archive), "13600")
+
+
+class TestSevenZip(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.archive = formats.open_archive(SEVENZIP)
+
+    def test_entries(self):
+        names = [e.name for e in self.archive if not e.is_dir]
+        self.assertEqual(sorted(names), ["hello.txt", "note.txt"])
+
+    def test_encryption_detected(self):
+        self.assertEqual(len(self.archive.encrypted_entries), 2)
+        target = self.archive.hash_target()
+        self.assertEqual(target["data_type"], 2)
+        self.assertEqual(target["cycles"], 19)
+
+    def test_hash_line(self):
+        line = self.archive.hashes()[0]
+        self.assertTrue(line.startswith("$7z$2$19$0$$16$"))
+        self.assertEqual(formats.mode_for(self.archive), "11600")
+
+
+class TestFormats(unittest.TestCase):
+    def test_sniff(self):
+        self.assertEqual(formats.sniff(SAMPLE), "RAR5")
+        self.assertEqual(formats.sniff(ZIP), "ZIP")
+        self.assertEqual(formats.sniff(SEVENZIP), "7Z")
+
+    def test_targets(self):
+        cases = {SAMPLE: "rar5", ZIP: "zipcrypto", ZIP_AES: "zipaes", SEVENZIP: "7zip"}
+        for path, kind in cases.items():
+            target = formats.pick_target(formats.open_archive(path))
+            self.assertIsNotNone(target, path)
+            self.assertEqual(target.kind, kind, path)
+
+    def test_cpu_support(self):
+        self.assertTrue(formats.pick_target(formats.open_archive(SAMPLE)).supports_cpu())
+        self.assertFalse(formats.pick_target(formats.open_archive(SEVENZIP)).supports_cpu())
+
+
+class TestForensics(unittest.TestCase):
+    def test_analyze(self):
+        report = forensics.analyze(SAMPLE)
+        self.assertEqual(report.format, "RAR5")
+        self.assertEqual(report.files, 2)
+        self.assertEqual(len(report.byte_fingerprint), 64)
+        self.assertEqual(len(report.payload_fingerprint), 64)
+
+    def test_same_payload_detected(self):
+        reports = [forensics.analyze(ZIP_AES), forensics.analyze(SEVENZIP)]
+        groups = forensics.compare(reports)
+        self.assertEqual(len(groups["repacks"]), 1)
+        self.assertEqual(groups["identical"], [])
 
 
 if __name__ == "__main__":

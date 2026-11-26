@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .rar5 import Archive, ArchiveError
+from . import formats
+from .rar5 import ArchiveError
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
 
@@ -36,8 +37,12 @@ class Discovered:
 
 @dataclass
 class Group:
-    hash_line: str
+    signature: tuple
     archives: list[Discovered] = field(default_factory=list)
+
+    @property
+    def targets(self) -> int:
+        return len(self.signature)
 
 
 def find_archives(root: str, recursive: bool = True) -> list[str]:
@@ -48,12 +53,12 @@ def find_archives(root: str, recursive: bool = True) -> list[str]:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for name in filenames:
-                if name.lower().endswith((".rar", ".rev")):
+                if name.lower().endswith((".rar", ".rev", ".zip", ".7z")):
                     found.append(os.path.join(dirpath, name))
     else:
         for name in os.listdir(root):
             path = os.path.join(root, name)
-            if os.path.isfile(path) and name.lower().endswith((".rar", ".rev")):
+            if os.path.isfile(path) and name.lower().endswith((".rar", ".rev", ".zip", ".7z")):
                 found.append(path)
     return sorted(found)
 
@@ -62,7 +67,7 @@ def scan(root: str, recursive: bool = True) -> list[Discovered]:
     items: list[Discovered] = []
     for path in find_archives(root, recursive):
         try:
-            items.append(Discovered(path=path, archive=Archive.open(path)))
+            items.append(Discovered(path=path, archive=formats.open_archive(path)))
         except ArchiveError as exc:
             items.append(Discovered(path=path, error=str(exc)))
         except OSError as exc:
@@ -71,9 +76,11 @@ def scan(root: str, recursive: bool = True) -> list[Discovered]:
 
 
 def group_by_target(items: list[Discovered]) -> list[Group]:
-    """Archives that share a salt and KDF cost share the same cracking target."""
-    groups: dict[str, Group] = {}
+    """Archives with the same set of crack targets share one cracking effort."""
+    groups: dict[tuple, Group] = {}
     for item in items:
-        for line in item.hashes:
-            groups.setdefault(line, Group(hash_line=line)).archives.append(item)
+        signature = tuple(item.hashes)
+        if not signature:
+            signature = ("local-%s" % item.path,)
+        groups.setdefault(signature, Group(signature=signature)).archives.append(item)
     return sorted(groups.values(), key=lambda g: len(g.archives), reverse=True)

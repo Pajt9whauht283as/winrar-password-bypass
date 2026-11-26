@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "winrar-password-bypass"
-version = "1.1.0"
-description = "RAR5 hash extractor, verifier and GPU cracking pipeline for password-protected WinRAR archives"
+version = "1.2.0"
+description = "RAR5, ZIP and 7z password cracking toolkit: header extraction, hashcat pipeline, forensics"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

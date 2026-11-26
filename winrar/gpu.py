@@ -158,9 +158,10 @@ def run(
     label: str = "",
     force: bool = False,
     status_lines: bool = True,
+    mode: str = MODE_RAR5,
 ) -> tuple[Status, str]:
     """Run hashcat, stream status into a progress bar, return (status, raw_output)."""
-    cmd = [exe, "-m", MODE_RAR5, *args]
+    cmd = [exe, "-m", mode, *args]
     if status_lines:
         cmd += ["--status", "--status-timer", "2"]
     if force:
@@ -252,11 +253,12 @@ def crack_wordlist(
     quiet: bool = False,
     force: bool = False,
     workload: int = 3,
+    mode: str = MODE_RAR5,
 ) -> tuple[Status, dict[str, str]]:
     args = ["-a", "0", hashfile, wordlist, "--potfile-path", potfile, "-w", str(workload)]
     if rule:
         args += ["-r", rule]
-    status, _ = run(exe, args, quiet=quiet, label="gpu wordlist", force=force)
+    status, _ = run(exe, args, quiet=quiet, label="gpu wordlist", force=force, mode=mode)
     return status, read_potfile(potfile)
 
 
@@ -269,9 +271,10 @@ def crack_stream(
     force: bool = False,
     workload: int = 3,
     label: str = "gpu stream",
+    mode: str = MODE_RAR5,
 ) -> tuple[Status, dict[str, str]]:
     args = ["-a", "0", hashfile, "--stdin", "--potfile-path", potfile, "-w", str(workload)]
-    status, _ = run(exe, args, stdin_lines=lines, quiet=quiet, label=label, force=force)
+    status, _ = run(exe, args, stdin_lines=lines, quiet=quiet, label=label, force=force, mode=mode)
     return status, read_potfile(potfile)
 
 
@@ -284,16 +287,17 @@ def crack_mask(
     quiet: bool = False,
     force: bool = False,
     workload: int = 3,
+    mode: str = MODE_RAR5,
 ) -> tuple[Status, dict[str, str]]:
     args = ["-a", "3", hashfile, mask, "--potfile-path", potfile, "-w", str(workload)]
     for index, charset in enumerate(custom or [], start=1):
         args += ["-1" if index == 1 else "-%d" % index, charset]
-    status, _ = run(exe, args, quiet=quiet, label="gpu mask", force=force)
+    status, _ = run(exe, args, quiet=quiet, label="gpu mask", force=force, mode=mode)
     return status, read_potfile(potfile)
 
 
-def benchmark(exe: str, quiet: bool = False) -> tuple[float, str]:
-    status, output = run(exe, ["-b", "-m", MODE_RAR5], quiet=True, force=True, status_lines=False)
+def benchmark(exe: str, quiet: bool = False, mode: str = MODE_RAR5) -> tuple[float, str]:
+    status, output = run(exe, ["-b"], quiet=True, force=True, status_lines=False, mode=mode)
     combined = re.search(r"Speed\.#\*\.+:\s*([\d.]+)\s*([kKmMgGtT]?)H/s", output)
     if combined:
         return _parse_speed(*combined.groups()), output.strip()

@@ -1,25 +1,28 @@
 # WinRaR Password Bypass
 
-**RAR5 hash extraction, GPU cracking, verification and extraction — as one tool.**
+**One toolkit for password-protected archives: RAR5, ZIP (ZipCrypto and WinZip AES), and 7z.**
+
+Reads the encryption parameters straight out of the container headers, drives hashcat when a
+GPU is available, falls back to a multiprocess CPU engine when it is not, verifies every hit
+against the archive itself, and only then unpacks. Plus a forensics mode that fingerprints
+archives, builds a timeline, and spots re-packs and re-downloads.
 
 No WinRAR install. No uploading your archive to someone's website. No "password unlocker"
-installer. Reads the encryption parameters straight out of the RAR5 header, drives hashcat
-when there is a GPU, falls back to a multiprocess CPU engine when there is not, verifies every
-hit against the archive's own check value, and only then unpacks.
+installer.
 
 ```
 $ python main.py info secret.rar
 ┌─ secret.rar ────────────────────────────────────────────────────────────────
     format       RAR5
     files        94  (98 MB unpacked)
-    headers      readable
-    encryption   AES-256, 32800 iterations (log2=15)
+    crypto       AES-256 RAR5 (PBKDF2-HMAC-SHA256)
+    kdf          32800 iterations (log2=15)
     salt         9bfa25a6730fbdcc3e532776d3b69e59
-    targets      1 distinct key context(s), 53 encrypted file(s)
+    targets      53 encrypted file(s)
 
 $ python main.py crack secret.rar --auto --gpu --extract
 ┌─ crack: secret.rar ─────────────────────────────────────────────────────────
-    engine       hashcat (v7.1.2)
+    engine       hashcat (v7.1.2, mode 13000)
 
   · targeted guesses
   ! exhausted targeted guesses
@@ -30,30 +33,42 @@ $ python main.py crack secret.rar --auto --gpu --extract
     password     123
     verified     yes
     time         8.1 s
-
-  archive   opens  files
-  ────────────────────────
-  secret.rar  yes      94
 ```
 
 ---
 
 ## Contents
 
+- [Format support](#format-support)
 - [Install](#install)
 - [Commands](#commands)
+- [Forensics](#forensics)
 - [The crack pipeline](#the-crack-pipeline)
 - [What "bypass" actually means](#what-bypass-actually-means)
 - [Architecture](#architecture)
-- [Internals: RAR5 and the check value](#internals-rar5-and-the-check-value)
+- [Internals](#internals)
 - [Case study](#case-study)
 - [Speed reality check](#speed-reality-check)
-- [What does not work](#what-does-not-work)
-- [Other archive formats](#other-archive-formats)
+- [Limits and what does not work](#limits-and-what-does-not-work)
 - [Development](#development)
 - [License](#license)
 
 ---
+
+## Format support
+
+| Container | Detection | Crack engine | hashcat mode | Local verifier |
+|---|---|---|---|---|
+| RAR5 | header block chain | CPU or GPU | `13000` | PBKDF2 pswcheck, ~10 ms |
+| ZIP + ZipCrypto | central directory | **CPU, ~2.5 M guesses/s** | — (no KDF to attack) | header byte + inflate + CRC |
+| ZIP + WinZip AES | `0x9901` extra field | GPU | `13600` | 7-Zip test on the hit |
+| 7z + 7zAES | header property tree | GPU | `11600` | 7-Zip test on the hit |
+
+ZipCrypto has no key derivation function: three 32-bit keys advance per password byte, so a
+pure-Python engine beats waiting for a GPU round-trip, and masks on short passwords become
+realistic. RAR5 and 7z are deliberately slow by design, so they lean on hashcat.
+
+RAR4 is detected and refused with the mode you actually want (`12500` + `rar2john`).
 
 ## Install
 
@@ -65,15 +80,13 @@ cd winrar-password-bypass
 python main.py doctor
 ```
 
-Optional, but the tool uses them when present:
+Optional, used when present:
 
 | Component | What it adds |
 |---|---|
-| [hashcat](https://hashcat.net/hashcat/) 7.x | GPU cracking, ~37 kH/s on an RTX 3060 instead of ~1.3 kH/s on CPU |
-| 7-Zip or UnRAR | `--extract`, and second-opinion password tests |
-| rockyou or any wordlist | the actual dictionary; a 2000-entry list ships built in |
-
-`python main.py doctor` prints exactly what it found:
+| [hashcat](https://hashcat.net/hashcat/) 7.x | GPU cracking for RAR5, 7z and WinZip AES |
+| 7-Zip or UnRAR | `--extract`, and the verifier for 7z / AES zip |
+| rockyou or any wordlist | the dictionary; a 2000-entry list ships built in |
 
 ```
 ┌─ doctor ────────────────────────────────────────────────────────────────────
@@ -87,217 +100,173 @@ Optional, but the tool uses them when present:
     unrar        C:\Program Files\WinRAR\UnRAR.exe
     potfile      C:\Users\you\.winrar-bypass\potfile
     builtin list 2003 passwords
+    zipcrypto    1.6M guesses/s per core
 ```
-
-`--hashcat PATH` and `--sevenzip PATH` override detection anywhere it is needed.
-
----
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `info <archive...>` | headers, KDF parameters, salt, file tree — no password |
-| `hash <archive...>` | hashcat mode 13000 lines, `-o` to write a file |
-| `verify <archive> <password>` | one PBKDF2 round, ~10 ms, exit code 0/1 |
+| `info <archive...>` | headers, crypto, KDF, salt, file tree — no password |
+| `hash <archive...>` | hashcat lines for the format (`13000`, `11600`, `13600`) |
+| `verify <archive> <password>` | one local check, exit code 0/1 |
 | `crack <archive...>` | staged attack: targeted, wordlist, mutations, mask |
-| `scan <path>` | find every `.rar` under a tree and group identical targets |
+| `forensics <path>` | fingerprints, timeline, compression profile, duplicates |
+| `scan <path>` | find every archive under a tree and group identical targets |
 | `bench <archive>` | measure this machine and print time-to-exhaustion tables |
-| `doctor` | environment check: python, hashcat, devices, extractors |
+| `doctor` | environment check |
 
-Everything machine-readable: `info`, `hash`, `scan` and `crack` take `--json`.
+`info`, `hash`, `scan`, `forensics` and `crack` all take `--json`.
 
-### info
-
-```bash
-python main.py info pack.rar --all          # every entry, not the first 15
-```
-
-Shows whether *headers* are encrypted separately from *data*, the exact iteration count and
-salt, and how many distinct key contexts exist. When all entries share a salt — the normal
-case — one crack opens everything.
-
-### hash
+### Per format
 
 ```bash
-python main.py hash pack.rar -o rar5.hash
-hashcat -m 13000 rar5.hash rockyou.txt
+# RAR5
+python main.py crack pack.rar --auto --gpu --extract
+python main.py crack pack.rar -w rockyou.txt --mutate 2 --hashcat C:\hashcat\hashcat.exe
+
+# ZIP with ZipCrypto: no GPU needed, masks are cheap
+python main.py crack photos.zip --auto
+python main.py crack photos.zip --mask '?l?l?l?l?l?l'
+
+# ZIP with WinZip AES, and 7z
+python main.py crack vault.zip -w rockyou.txt --gpu
+python main.py crack backup.7z -w rockyou.txt --gpu
 ```
 
-The output is a standard `$rar5$16$<salt>$<kdf>$<iv>$8$<check>` line. It only needs the header
-of the archive, so a partial download is enough to start attacking.
-
-### crack
+Multiple archives at once: the cheapest one is cracked, then the password is tested against
+every other archive — the reuse attack in one command.
 
 ```bash
-python main.py crack pack.rar --auto                       # targeted + built-in list
-python main.py crack pack.rar -w rockyou.txt               # dictionary
-python main.py crack pack.rar -w rockyou.txt --mutate 2    # + rules baked into python
-python main.py crack pack.rar --mask '?l?l?l?l?l?l'        # brute force
-python main.py crack pack.rar -w words.txt --gpu --extract # hashcat, then unpack
+python main.py crack a.rar b.rar c.7z -w rockyou.txt --gpu
 ```
 
-Multiple archives at once: the cheapest one is cracked, then the recovered password is tested
-against every other archive you listed — the password-reuse attack, one command.
+Other flags: `--threads N`, `--workload 1..4`, `--rule file.rule`, `--charset SET`,
+`--mutate 0..3`, `--resume state.json`, `--max-mask-hours H`, `--force`, `--extract`, `-o DIR`,
+`--sevenzip PATH`, `-q`.
+
+## Forensics
 
 ```bash
-python main.py crack a.rar b.rar c.rar -w rockyou.txt --gpu
-```
-
-Other flags:
-
-| Flag | Meaning |
-|---|---|
-| `--gpu` / `--hashcat PATH` | use hashcat, stream candidates into it |
-| `--threads N` | CPU worker count (default: all cores) |
-| `--workload 1..4` | hashcat `-w`, default 3 |
-| `--rule file.rule` | hashcat rules for GPU wordlist stages |
-| `--charset SET` | custom charset for `?1..?4`, repeatable |
-| `--mutate 0..3` | built-in mutation depth applied to each wordlist |
-| `--resume state.json` | continue a CPU run where it stopped |
-| `--max-mask-hours H` | refuse masks that need longer, default 12 (override `--force`) |
-| `--force` | ignore the mask guard, pass `--force` to hashcat |
-| `--extract` / `-o DIR` | unpack after success |
-
-### scan
-
-```bash
-python main.py scan D:\Downloads
+python main.py forensics D:\Downloads\packs
 ```
 
 ```
-  archive                     group  state  files   size
-  ─────────────────────────────────────────────────────────
-  Fortnite_Menu_Syntax3.rar   1      enc        94   98 MB
-  Fortnite_Menu_Syntax3 (1).rar 1    enc        94   98 MB
-  Fortnite_Menu_Syntax3 (2).rar 1    enc        94   98 MB
-  other_pack.rar              2      enc        12   4 MB
-  screenshots.rar             -      open      310  22 MB
+┌─ pack_v2.rar ───────────────────────────────────────────────────────────────
+    format       RAR5
+    size         82 MB on disk, 98 MB unpacked, 94 files
+    crypto       AES-256 RAR5 (PBKDF2-HMAC-SHA256)
+    kdf          32800 iterations (log2=15)
+    salt         9bfa25a6730fbdcc3e532776d3b69e59
+    timeline     2026-11-06 04:15 .. 2026-11-06 05:55 (0.1 days)
+    largest      arena_showcase.mp4 (43.9 MB)
+    methods      normal x91, store x3
+    bytes fp     9a2de82278f9afb65344efb18b26ea37...
+    payload fp   0b2ec97241e403fbbbcefa603fc55c10...
+
+· relationships
+  identical bytes                  pack.rar, pack (1).rar
+  same payload, different archive  pack.rar, backup.7z
 ```
 
-Archives in the same group share a salt and KDF cost: identical copies, or the same pack
-re-downloaded. One crack covers the whole group, and the tool says so instead of burning the
-GPU three times.
+Two fingerprints, on purpose:
 
-### verify
+- **bytes fingerprint** — SHA-256 of the first 64 KiB. Identical means the same file, byte for
+  byte: a re-download.
+- **payload fingerprint** — SHA-256 over the sorted `name:size` list. Identical means the same
+  content re-packed into a different container or a different compression method.
 
-```bash
-python main.py verify pack.rar "hunter2"
-# password 'hunter2' -> no (10.5 ms)
-```
-
-Uses the same fold WinRAR uses. No extraction, no hashcat, no temp files — useful for checking
-a guess by hand or in a script.
-
----
+That distinction is what tells an analyst whether two archives are the same distribution or a
+repack, and it is computed without the password.
 
 ## The crack pipeline
 
-Stages run cheapest-first, and the first hit stops everything.
+Stages run cheapest-first and the first verified hit stops everything.
 
-| # | Stage | Source | Typical cost | Hit rate |
+| # | Stage | Source | Typical cost | Notes |
 |---|---|---|---|---|
-| 1 | targeted guesses | archive name, years, leet, neighbours | seconds | high for packs named after their product |
+| 1 | targeted guesses | archive name, years, leet, sibling names | seconds | high hit rate on packs named after their product |
 | 2 | built-in top list | 2000 passwords shipped in the package | seconds | absurdly high |
-| 3 | wordlist | rockyou, top-10M, your own list | minutes | the main workhorse |
+| 3 | wordlist | rockyou, top-10M, your own | minutes | the workhorse |
 | 4 | mutations | case, leet, 0-999 suffixes, years, separators | hours | catches `Arena2025!` |
-| 5 | mask | `?u?l?l?l?l?l?d?d`, custom charsets | hours-days | only when shape is known |
+| 5 | mask | `?u?l?l?l?l?l?d?d`, custom charsets | hours-days | guarded by an ETA check |
 
-The GPU path does not reimplement any of this in Python: generated candidates are **streamed
-into `hashcat --stdin`**, so wordlists, mutation levels and masks all run at native hashcat
-speed. Wordlists go straight to disk input, masks use hashcat's own `-a 3` engine, and only
-generated streams take the pipe.
+GPU stages stream generated candidates into `hashcat --stdin`, so mutations and targeted
+guesses run at native hashcat speed; wordlists go straight to disk input and masks use
+hashcat's own `-a 3`.
 
-CPU mode is a `multiprocessing.Pool` with batches of `threads * 32` candidates, a shared
-PBKDF2 context per worker, live rate and ETA, and a resume file keyed by stage name. It runs at
-roughly 85 guesses/s per core, so 16 cores land near 1.3 kH/s — enough for dictionaries, not
-for masks, which is why the mask guard exists.
+CPU stages use a `multiprocessing.Pool` with batches of `threads * 32` candidates for PBKDF2
+formats, `threads * 4096` for ZipCrypto, live rate and ETA, and per-stage resume.
 
-Every hit is verified twice: our own PBKDF2 check (nothing stale from a potfile can slip
-through) and, on extraction, 7-Zip's own decryption.
-
----
+Every hit is confirmed twice: locally against the container's own check (PBKDF2 pswcheck,
+ZipCrypto header + inflate + CRC, or 7z/zip via the extraction tool), and again on extraction.
 
 ## What "bypass" actually means
 
-A password-protected RAR5 is encrypted, not gated:
+A password-protected archive is encrypted, not gated:
 
-| Layer | Detail |
-|---|---|
-| Cipher | AES-256-CBC, one key per archive password |
-| Key derivation | PBKDF2-HMAC-SHA256, `1 << kdf_count` iterations (normally 32768, +32 in the loop) |
-| Salt | 16 bytes in the header |
-| IV | 16 bytes per file |
-| Password check | 12 bytes in the header; first 8 are a fold of the derived key |
+| Format | Cipher | KDF | Verifier |
+|---|---|---|---|
+| RAR5 | AES-256-CBC, per-file IV | PBKDF2-HMAC-SHA256, 32768+ rounds | 8-byte fold of the key |
+| ZIP AES | AES-128/192/256, CBC | PBKDF2-HMAC-SHA1, 1000 rounds | 2-byte password value + HMAC-SHA1 auth code |
+| 7z | AES-256-CBC | SHA-256 chain, 2^19 rounds | CRC32 of the unpacked stream |
+| ZIP ZipCrypto | custom 3-key stream | none | 1 byte of the 12-byte header |
 
-There is no master key and no "unlock" flag. Instant removal claims are malware, data loss, or
-a dictionary attack with a progress bar. Three things genuinely work:
+There is no master key and no unlock flag. Three things genuinely work:
 
-1. **Guess fast.** GPUs turn a slow KDF into thousands of guesses per second. Almost every
-   real-world win is a human picking a weak password, not a broken cipher.
-2. **Read what is not encrypted.** With header encryption off, the archive tells you file
-   names, sizes, timestamps, salt and iteration count before you guess anything.
-3. **Never pay twice.** Packs are reposted. One password usually opens a family of archives,
-   which is what `scan` and the multi-archive `crack` exist for.
-
----
+1. **Guess fast.** GPUs on the slow KDFs, raw Python on ZipCrypto which has no KDF at all.
+2. **Read what is not encrypted.** With header encryption off, names, sizes, salts and cost are
+   all readable before you guess anything.
+3. **Never pay twice.** Packs are reposted; one password usually opens a family.
 
 ## Architecture
 
 ```
 main.py                  entry point, four lines of glue
 winrar/
-  cli.py                 argparse, stage builder, attack orchestration, reporting
-  rar5.py                container parser: block chain, vints, extra records, entries
-  crypto.py              PBKDF2, check-value fold, verify, benchmark
+  cli.py                 argparse, attack staging, reporting
+  formats.py             signature sniffing, uniform view, target selection
+  rar5.py                RAR5 block chain, extra records, RAR5 crypto metadata
+  sevenzip.py            7z header property tree, 7zAES parameters, $7z$ emission
+  ziparchive.py          ZIP central directory, AES extra field, $zip2$ emission
+  zipcrypto.py           PKWARE cipher, full verifier, fast CPU engine
+  crypto.py              RAR5 PBKDF2, check fold, verify, benchmark
   attacks.py             wordlists, mutations, masks, hybrids, targeted guesses
-  engine.py              CPU cracker: multiprocessing, batching, progress, resume
+  engine.py              PBKDF2 CPU cracker: multiprocessing, batching, resume
   gpu.py                 hashcat detection, stdin streaming, status parsing, potfile
+  forensics.py           fingerprints, timeline, compression profile, grouping
   extract.py             7-Zip / UnRAR detection, password test, extraction
   batch.py               directory scan and grouping by KDF context
   ui.py                  colours, boxes, tables, progress bars, human units
   data/top-passwords.txt built-in 2000-entry list
-tests/test_rar5.py       20 unit tests against the shipped sample archive
-examples/sample.rar      tiny encrypted archive, password 123
+tests/                   35 unit tests over four shipped sample archives
+examples/                tiny RAR5, ZipCrypto, AES zip and 7z archives, password 123
 ```
 
-Each module has one job and no import cycles: `rar5` knows the format, `crypto` knows the
-math, `attacks` produces candidates, `engine` and `gpu` consume them, `cli` decides the order.
-Adding an attack means yielding strings from a new generator in `attacks.py` and naming it in
-`cli.build_stages`.
+## Internals
 
----
+**RAR5.** Blocks are `crc32 | header_size (vint) | header`; record type `1` in a file's extra
+area is the encryption record (`version, flags, kdf_count, salt[16], iv[16], check[12]`). The
+check is `w0^w2^w4^w6 ‖ w1^w3^w5^w7` over the first eight PBKDF2 words. Compression info packs
+`(method << 7) | (solid << 6) | version`, and WinRAR 7 writes bits above bit 10, so the method
+is `(comp >> 7) & 0xF`.
 
-## Internals: RAR5 and the check value
+**ZipCrypto.** Keys start at `0x12345678, 0x23456789, 0x34567890`, each password byte updates
+all three, and the keystream byte comes from `(k2 | 2) * ((k2 | 2) ^ 1) >> 8 & 0xFF`. The last
+of the 12 header bytes must equal the high CRC byte (or the high time byte when a data
+descriptor is used). That is a 1-in-256 filter, so the tool always re-decrypts the body,
+inflates it and compares the CRC before accepting a hit.
 
-RAR5 stores everything in a chain of blocks: `crc32 | header_size (vint) | header`. A file
-header carries an extra area of typed records; record type `1` is encryption:
+**7z.** The header is a property tree (`kPackInfo`, `kUnPackInfo`, `kFilesInfo`) and is usually
+LZMA-compressed itself — inflated here with the stdlib `lzma` module, no 7z binary needed. The
+AES coder property byte packs `cycles` and the presence of salt/IV. Three details cost real
+time to get right and are documented in the code:
 
-```
-version    vint
-flags      vint
-kdf_count  1 byte        -> iterations = (1 << kdf_count) + 32
-salt       16 bytes
-iv         16 bytes
-check      12 bytes      -> first 8 bytes are the password check
-```
-
-Compression info is packed as `(method << 7) | (solid << 6) | version`, and both masks have to
-be applied carefully: WinRAR 7 writes extra bits above bit 10, so `method` is `(comp >> 7) & 0xF`,
-not `comp >> 7`. Getting that wrong turns every entry into "m67".
-
-The check itself:
-
-```python
-key = pbkdf2_hmac("sha256", password.encode(), salt, (1 << log2) + 32, 32)
-w   = unpack("<8I", key)
-chk = pack("<2I", w[0] ^ w[2] ^ w[4] ^ w[6], w[1] ^ w[3] ^ w[5] ^ w[7])
-```
-
-That is byte-identical to what WinRAR compares and what hashcat's `m13000` kernel computes,
-which is why a hit here can be trusted without decrypting the payload.
-
----
+- 7-Zip's KDF counter is a little-endian 64-bit value appended to the UTF-16LE password per
+  iteration, not big-endian.
+- The CRC that hashcat can verify is the **substream** (first file) CRC, not the folder CRC,
+  with `crc_len` equal to that file's unpacked size.
+- `kCRC` blobs start with a single `allAreDefined` byte, not two.
 
 ## Case study
 
@@ -305,40 +274,39 @@ An 82 MiB RAR5 pack pulled from a Discord CDN link. Headers readable, one KDF co
 
 ```
 $rar5$16$9bfa25a6730fbdcc3e532776d3b69e59$15$6c54a84371908514f508d6cb218379e1$8$24dd5a0a04188cae
-```
 
-```
 Speed.#01........: 37214 H/s
 Recovered........: 1/1 (100.00%) Digests
 Progress.........: 28672/14344384 (0.20%)
 ```
 
-Password **`123`**, candidate 28,672 of rockyou, eight seconds of GPU. Two sibling archives from
-the same channel opened with the same password on the first try — password reuse in one line.
+Password **`123`**, candidate 28,672 of rockyou, eight seconds of GPU. Two sibling archives
+from the same channel opened with the same password on the first try.
 
-The hash is kept in [`examples/rar5.hash`](examples/rar5.hash) as a public test vector, and
-[`examples/sample.rar`](examples/sample.rar) is a tiny archive built with the same password so
-the whole chain can be reproduced without shipping anyone else's archive:
+The hash is kept in [`examples/rar5.hash`](examples/rar5.hash); the four sample archives are
+built with the same password so the whole chain reproduces:
 
 ```bash
-python main.py crack examples/sample.rar --auto
+python main.py crack examples/sample_zipcrypto.zip --auto
+python main.py crack examples/sample_plain.7z -w wordlist.txt --gpu
 python -m unittest discover -s tests -v
 ```
-
----
 
 ## Speed reality check
 
 Measured on an RTX 3060 12 GB and a Ryzen 7 7800X3D:
 
-| Engine | RAR5 guesses/s |
-|---|---|
-| CPU, one core | ~85 |
-| CPU, 16 threads | ~1.3 kH/s |
-| GPU, RTX 3060 | ~37 kH/s |
-| GPU, RTX 4090 (reference) | ~120 kH/s |
+| Format | Engine | Guesses/s |
+|---|---|---|
+| ZipCrypto | CPU, one core | ~1.6 M |
+| ZipCrypto | CPU, 16 threads | ~2.5 M |
+| RAR5 | CPU, one core | ~85 |
+| RAR5 | CPU, 16 threads | ~1.3 K |
+| RAR5 | GPU | ~37 K |
+| 7z | GPU | ~40 K |
+| WinZip AES | GPU | ~500 K |
 
-What that buys at 37 kH/s:
+What that buys at 37 kH/s for RAR5:
 
 | Keyspace | Time |
 |---|---|
@@ -348,51 +316,39 @@ What that buys at 37 kH/s:
 | `?l?l?l?l?l?l` (309M) | 2.3 h |
 | `?l?l?l?l?l?l?d?d` (30.9G) | 9.6 days |
 
-That table is the whole strategy: dictionaries and rules, never blind brute force.
+ZipCrypto at 2.5 M/s finishes `?l?l?l?l?l?l` in two minutes — that gap is why the format
+matters more than the hardware.
 
----
+## Limits and what does not work
 
-## What does not work
+Deliberate limits, reported instead of guessed at:
 
-- **"Repair archive" in WinRAR.** Rebuilds headers, decrypts nothing.
-- **Convert to ZIP, rename, re-archive.** The payload stays AES blocks.
-- **CVE-2023-38831 / CVE-2022-30333.** Spoofed extensions and path traversal on extraction.
-  Neither recovers a password.
-- **Known plaintext on RAR5.** You may know every byte of the vendored files inside. AES-256-CBC
-  with a PBKDF2 key gives you nothing to invert. Known-plaintext attacks belong to legacy ZIP.
-- **Commercial unlocker GUIs.** hashcat in a window with a smaller wordlist and a larger price.
+- 7z with an explicit **salt** in the AES properties cannot be expressed as a hashcat `$7z$`
+  line; the tool says so and points at 7z2hashcat.
+- 7z streams larger than 8 MiB, and AES zip entries larger than 4 MiB, exceed hashcat's hook
+  buffers; the tool reports the size instead of emitting a hash that cannot verify.
+- ZipCrypto has no hashcat format here: the CPU engine is faster anyway.
+- RAR4 needs hashcat mode `12500` and `rar2john`.
 
-Header encryption is not a bypass either: it hides the file names and per-file IVs, but the
-salt and KDF cost are still in the archive header, so the attack is the same — you just cannot
-pick the smallest entry first.
+Things that never work:
 
----
-
-## Other archive formats
-
-| Format | Real shortcut | Tooling |
-|---|---|---|
-| RAR5 | none, crack it | `main.py`, hashcat `13000` |
-| RAR3 / RAR4 | known plaintext speeds it up a lot | hashcat `12500` + `rar2john` |
-| 7z | none, crack it | hashcat `11600` |
-| ZIP + ZipCrypto | **bkcrack**: ~12 known bytes recover the keys, no password needed | `bkcrack` |
-| ZIP + AES-256 | none, crack it | hashcat `13600` |
-
-`main.py` detects these signatures and tells you which path to take instead of failing with
-"not a RAR5 archive".
-
----
+- "Repair archive" in WinRAR: rebuilds headers, decrypts nothing.
+- Convert to ZIP, rename, re-archive: the payload stays AES blocks.
+- CVE-2023-38831 / CVE-2022-30333: extension spoofing and path traversal on extraction.
+- Known plaintext on RAR5/7z/AES: AES-256-CBC with a KDF key gives nothing to invert.
+  Known-plaintext belongs to legacy ZipCrypto (`bkcrack`).
+- Commercial unlocker GUIs: hashcat in a window with a smaller wordlist and a bigger price.
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v     # 20 tests, no network, no GPU needed
-python main.py bench examples/sample.rar    # what this machine can do
+python -m unittest discover -s tests -v     # 35 tests, no network, no GPU needed
+python main.py bench examples/sample.rar
 pip install .                               # installs the `winrar-bypass` command
 ```
 
-The test suite builds every fixture from `examples/sample.rar`, so it stays deterministic and
-does not need an encrypted archive from anyone else.
+Every fixture is generated from the four shipped samples, so the suite is deterministic and
+never needs anyone else's archive.
 
 ## License
 
