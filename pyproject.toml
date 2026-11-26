@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winrar-password-bypass"
+version = "1.1.0"
+description = "RAR5 hash extractor, verifier and GPU cracking pipeline for password-protected WinRAR archives"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Pajt9whauht283as" }]
+keywords = ["winrar", "rar5", "hashcat", "password-recovery", "archive"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Topic :: System :: Archiving",
+]
+
+[project.scripts]
+winrar-bypass = "winrar.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Pajt9whauht283as/winrar-password-bypass"
+
+[tool.setuptools.packages.find]
+include = ["winrar*"]
+
+[tool.setuptools.package-data]
+winrar = ["data/*.txt"]

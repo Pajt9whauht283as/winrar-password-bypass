@@ -1,9 +1,18 @@
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
 
 # archives and cracking artifacts never belong in the repo
 *.rar
 !examples/sample.rar
 *.pot
+potfile
 cracked.txt
 wordlists/
+
+# local state written by the tool
+.winrar-bypass/
+*.state.json
